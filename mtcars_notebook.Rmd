@@ -1,0 +1,273 @@
+---
+title: "Case Study: mtcars2018"
+date: 11 July 2021
+output: 
+  html_notebook: 
+    highlight: kate
+---
+
+##### Overview
+The focus of this will be on implementing and tuning models using workflows from the tidymodels universe. Specifically, three models will be considered:
+
+* Linear Regression 
+* Random Forest
+* Random Forest with normalized features
+
+Random forest models typically don't require normalized, scaled, or centered, features. However, some earlier work indicated that RF models with processed features slightly outperformed model variants without processing.
+
+With the exception of the linear regression model, model hyper-parameters are tuned via grid search. 
+
+```{r setup, include = F}
+require( tidyverse )
+require( tidymodels )
+require( vip )
+
+theme_set( theme_bw() )
+
+set.seed( 1234 )
+
+```
+<br>
+
+##### Initial Exploratory Data Analysis (EDA)
+Some low level analysis was undertaken, primarily on numeric features. Analysis indicated there were no missing values and no features were considered to have near zero variance. Numeric features were then checked for correlations using a correlation plot. 
+
+```{r}
+data <- read_csv( "data/raw/cars2018.csv", col_types = cols() ) %>% select( -model, -model_index )
+
+target_feature <- "mpg"
+data_quant     <- data %>%
+                  select( where(is.numeric), -target_feature )
+
+data_corr <- cor( data_quant )
+
+corrplot::corrplot( data_corr, addgrid.col = rgb(0, 0, 0, .05), order = "hclust", diag = FALSE, tl.col = "black", tl.cex = .8, 
+                    addCoef.col = "black", number.cex = .5, addrect = 3, xpd = TRUE )
+
+```
+
+This revealed large correlations between intake and exhaust valves (*r* = .98), and cylinders and displacement (*r* = .93). There were also moderate correlations between displacement and exhaust (*r* = -.57), and intake (*r* = -.55). Cylinders also correlated moderately with both intake (*r* = -.36) and exhaust (*r* = -.39). Based upon this it was decided to drop "cylinders" and "exhaust_valves_per_cyl" from the set of features (alternatively, "displacement" and "intake_valves_per_cyl" could have been dropped).
+
+<br>
+
+##### Target Feature
+Examination of the distribution of the target feature indicated a positive. A Box Cox trasnformation was applied to the data before any further feature processing. This, in part, protects any ill effects that can arise when workflows are instructed to process outcome variables. It is best to undertake require transformations on the outcome variable in a separate step. 
+
+```{r}
+data %>% 
+  ggplot( aes(x = get(target_feature)) ) +
+  geom_histogram( bins = 25, col = "#0F5298", fill = "#3C99DC", alpha = .8) +
+  labs(x = "Fuel efficiency (mpg)",
+       y = "Number of cars") 
+```
+```{r}
+# Preprocessing of target feature
+
+model_formula <- cobalt::f.build( target_feature, rhs = "." )
+
+data_step <-  recipe( model_formula, data = data ) %>%
+              step_BoxCox( target_feature ) %>%
+              prep() %>%
+              juice()
+```
+
+##### Data Splits
+Split data first into training and testing sets. The training set will then be further split into 10 train and validation sets for cross validation. 
+```{r}
+# Split data into training and test sets
+drop_cols <- c("cylinders", "exhaust_valves_per_cyl")
+
+data_model <- data_step %>% select( -drop_cols )
+data_split <- initial_split( data_model, prop = .80 )
+data_train <- training( data_split ) 
+data_test  <- testing( data_split )
+
+# create splits for 10 fold cross validation
+cv_splits <- vfold_cv( data_train )
+
+# store numeric and categorical features names
+quant_features <- data_model %>% select( c(where(is.numeric), -target_feature) ) %>% names()
+cat_features   <- data_model %>% select( where(is.factor) ) %>% names()                                       
+```
+
+##### Model Specification
+Specify the models we intend to fit and the engines used to fit them. Despite fitting two variants of the random forest model, the model only needs to be specified once.
+
+```{r}
+# Specification for linear regression model. 
+lm_model_spec <- linear_reg( ) %>%
+                 set_engine( "lm" )
+
+# Specification for random forest model. Note the parameters indicated for tuning.
+rf_model_spec <- rand_forest( mtry = tune(), min_n = tune(), trees = 1000 ) %>%
+                 set_engine( "randomForest" ) %>%
+                 set_mode( "regression" )
+```
+
+##### Model Workflow
+Here the processing recipes are specified for the linear regression and random forest model. The features will be similarly processed so only a single recipe needs specifying. Specifically, all numeric predictors are scaled and centered after undergoing a Box-Cox transform. All categorical predictors are then dummy coded. The model specifications, along with any processing, are then added to the workflow.
+
+Recipe takes care of all data transformations and we no longer need to call juice() or bake() to process the data. Note that because the random forest model without feature processing doesn't require a recipe, the model formula needs to be included.
+
+```{r}
+model_recipe <- recipe( model_formula, data = data_train ) %>%
+                step_BoxCox( quant_features ) %>%
+                step_center( quant_features ) %>%
+                step_scale( quant_features ) %>%
+                step_dummy( cat_features )
+
+# Workflow for linear regression model
+lm_workflow <- workflow() %>%
+               add_recipe( model_recipe ) %>%
+               add_model( lm_model_spec )
+
+# Workflow for random forest model.
+rf_workflow <- workflow() %>%
+               add_model( rf_model_spec ) %>%
+               add_formula( model_formula )
+
+# Workflow for random forest model with processed features
+rf_prep_workflow <- workflow() %>%
+                    add_recipe( model_recipe ) %>%
+                    add_model( rf_model_spec )
+
+# Performance metrics
+perf_metrics <- metric_set( rmse, ccc )
+```
+##### Model Evaluation: Linear Regresssion
+There are no hyper-parameters to tune so model performance can be evaluated very simply. To examine model performance we can call last_fit() which fits the model to the entire training set and then validates the model on the test (hold out) data. The object provides the predictions and performance metrics for the test set. 
+
+```{r}
+# Model training via 10 fold cross validation
+train_lm_model <- lm_workflow %>%
+                  fit_resamples(
+                    resamples = cv_splits,
+                    metrics = perf_metrics,
+                    control = control_resamples( save_pred = TRUE ) 
+                  )
+
+train_lm_metrics <- collect_metrics( train_lm_model ) %>% mutate( .model = "lm" )
+
+# Model performance
+test_lm_model <- lm_workflow %>% 
+                 last_fit( split = data_split,
+                           metrics = perf_metrics )
+
+test_lm_metrics     <- collect_metrics( test_lm_model )
+test_lm_predictions <- collect_predictions( test_lm_model ) %>% select( .pred, mpg ) %>% rename( lm = .pred )
+
+```
+
+##### Model Evaluation: Random Forest
+Here there are two models that are being tuned. So that the models are both trained on the same hyper-parameter values, a regular grid will be created. The two parameters flagged for tuning are mtry - the number of predictors that will be randomly sampled at each split when creating the tree models - and min_n - the minimum number of data points in a node that are required for the node to be split further. Because mtry depends upon the number of predictors available the range for this parameter needs to be set before a grid can be made. For each parameter 5 levels will be selected which produces a total of 25 models to fit. 
+
+```{r}
+param_grid <- grid_regular(
+                mtry( c(1, ncol(data_train) - 1) ), # subtract 1 because one column is the target variable
+                min_n(),
+                levels = 5
+              )
+
+tune_rf_model <- rf_workflow %>% 
+                 tune_grid(
+                   resamples = cv_splits,
+                   grid = param_grid,
+                   metrics = perf_metrics,
+                   control = control_grid( verbose = FALSE ) 
+                 )
+
+tune_rf_prep_model <- rf_prep_workflow %>%
+                      tune_grid(
+                      resamples = cv_splits,
+                      grid = param_grid,
+                      metrics = perf_metrics,
+                      control = control_grid( verbose = FALSE ) 
+                     )
+
+autoplot( tune_rf_model )
+autoplot( tune_rf_prep_model )
+
+```
+Now that the models are tuned we want to find which of the parameter combinations produced the best performance. Though two metrics have been specified, we'll use RMSE as the criterion for model selection. The autoplot() function can be used plot performance as a function of different parameter combinations. 
+
+Once the best model is found the earlier model specifications are updated so the new parameter settings are included. The workflow for each model is then updated. The models are then validated on the test set by calling last_fit(). The model performance on the test set, including predictions, can then be stored for later. 
+```{r}
+# cross validation performance for each of the 25 models trained.
+tune_rf_metrics      <- collect_metrics( tune_rf_model )
+tune_rf_prep_metrics <- collect_metrics( tune_rf_prep_model )
+
+best_rf_model      <- tune_rf_model %>% select_best( metric = "rmse" )
+best_rf_prep_model <- tune_rf_prep_model %>% select_best( metric = "rmse" ) 
+
+# update model specifications with optimised parameters
+rf_model_spec_best      <- rf_model_spec %>% finalize_model( best_rf_model )
+rf_model_prep_spec_best <- rf_model_spec %>% finalize_model( best_rf_prep_model ) 
+
+# update workflows
+rf_workflow_best      <- rf_workflow %>% update_model( spec = rf_model_spec_best )
+rf_prep_workflow_best <- rf_prep_workflow %>% update_model( spec = rf_model_prep_spec_best )
+
+# validate best model on hold out set
+test_rf_model <- rf_workflow_best %>%
+                 last_fit(
+                   split = data_split,
+                   metrics = perf_metrics
+                 )
+
+test_rf_prep_model <- rf_prep_workflow_best %>%
+                      last_fit(
+                        split = data_split,
+                        metrics = perf_metrics
+                      )
+
+# Model performance
+test_rf_metrics      <- collect_metrics( test_rf_model )
+test_rf_prep_metrics <- collect_metrics( test_rf_prep_model )
+
+test_rf_predictions      <- collect_predictions( test_rf_model ) %>% select( .pred, mpg ) %>% rename( rf = .pred )
+test_rf_prep_predictions <- collect_predictions( test_rf_prep_model ) %>% select( .pred, mpg ) %>% rename( rf_prep = .pred )
+
+```
+
+#### Visualise Model Performance
+Now that the models have all been validated on the test data, their performance can be plotted. To do this we pull together all the predictions into a single data frame. We then plot the predicted valued as a function of the actual values.
+
+```{r}
+model_predictions <- test_lm_predictions %>% 
+                     bind_cols( test_rf_predictions %>% select( rf), 
+                                test_rf_prep_predictions %>% select( rf_prep) 
+                              ) %>%
+                     pivot_longer( cols = c("lm", "rf", "rf_prep"), 
+                                   names_to = "model",
+                                   values_to = ".pred") %>%
+                     mutate( label = recode(model, "lm" = "Linear Regression", "rf" = "Random Forest", "rf_prep" = "Random Forest (normalized)")) 
+
+model_predictions %>%
+  ggplot( aes( x = get(target_feature), y = .pred ) ) +
+  geom_abline( lty = 2, color = "#3C99DC", alpha = .8 ) +   # reference line
+  geom_point( size = 1.5, alpha = 0.3, show.legend = FALSE ) + 
+  geom_smooth( method = "lm", col = "#0F5298", fill = "#3C99DC") +
+  facet_wrap( ~ label ) +
+  labs( x = "Actual Values", y = "Predicted Values", subtitle = "Model Performance on Test Data") +
+  theme( strip.background = element_rect( fill = "#0F5298", color = "#0F5298"),
+         strip.text = element_text( color = "white", size = 12) )
+
+```
+Both random forest models outperform the linear regression model. However, it appears that it doesn't matter whether the predictors are normalized or not. Performance seems to be unaffected by this. The importance of each predictor can be examined to see what is driving performance. 
+```{r}
+test_rf_model %>% pluck(".workflow", 1) %>% 
+                  pull_workflow_fit %>% 
+                 vip( geom = c("point"),
+                      aesthetics = list(col = "#0F5298", size = 3) ) +
+                 geom_segment( aes(x = Variable, xend = Variable, y = 0, yend = Importance), col = "#0F5298" ) +
+                 labs( subtitle = "Variable Importance for Random Forest Model")
+
+test_rf_prep_model %>% pluck(".workflow", 1) %>% 
+                  pull_workflow_fit %>% 
+                  vip( geom = c("point"),
+                       aesthetics = list(col = "#0F5298", size = 3) ) +
+                 geom_segment( aes(x = Variable, xend = Variable, y = 0, yend = Importance), col = "#0F5298" ) +
+                 labs( subtitle = "Variable Importance for Random Forest (normalized) Model")
+```
+
+
